@@ -5,7 +5,7 @@ from rachacontas.core.adaptadores import (
     AdaptadorPlanilhaGenerica,
     reais_para_centavos,
 )
-from rachacontas.core.importacao import GastoImportado
+from rachacontas.core.importacao import ErroImportacao, GastoImportado
 
 
 def test_reais_para_centavos_formatos_comuns() -> None:
@@ -40,7 +40,7 @@ def test_adaptador_csv_banco_retorna_gastos_em_centavos() -> None:
 
 
 def test_adaptador_csv_banco_aceita_latin1() -> None:
-    conteudo = 'Descrição,Valor\nAçaí da praça,"15,50"\n'.encode("latin-1")
+    conteudo = 'Data,Descrição,Valor\n26/11/2026,Açaí da praça,"15,50"\n'.encode("latin-1")
 
     gastos = AdaptadorCsvBanco().ler(conteudo)
 
@@ -49,31 +49,56 @@ def test_adaptador_csv_banco_aceita_latin1() -> None:
 
 def test_adaptador_planilha_generica_aceita_separador_virgula() -> None:
     conteudo = (
-        "item,preco\n"
-        "Porção de batata,35.00\n"
-        "Cerveja,18.50\n"
+        "item,preco,pagador\n"
+        "Porção de batata,35.00,Carol\n"
+        "Cerveja,18.50,Murilo\n"
     ).encode("utf-8")
 
     gastos = AdaptadorPlanilhaGenerica().ler(conteudo)
 
     assert gastos == [
-        GastoImportado(descricao="Porção de batata", valor=3500, linha=2),
-        GastoImportado(descricao="Cerveja", valor=1850, linha=3),
+        GastoImportado(descricao="Porção de batata", valor=3500, linha=2, pagador="Carol"),
+        GastoImportado(descricao="Cerveja", valor=1850, linha=3, pagador="Murilo"),
     ]
 
 
 def test_adaptador_planilha_generica_aceita_tsv_e_arquivo_vazio() -> None:
-    conteudo = "Nome\tTotal\nÁgua\t5,00\n".encode("utf-8")
+    conteudo = "Nome\tTotal\tNome do Pagador\nÁgua\t5,00\tGustavo\n".encode("utf-8")
 
     assert AdaptadorPlanilhaGenerica().ler(conteudo) == [
-        GastoImportado(descricao="Água", valor=500, linha=2),
+        GastoImportado(descricao="Água", valor=500, linha=2, pagador="Gustavo"),
     ]
     assert AdaptadorPlanilhaGenerica().ler(b"   \n") == []
 
 
-def test_adaptador_erro_quando_falta_coluna_ou_valor_invalido() -> None:
+def test_adaptador_erro_quando_falta_coluna_obrigatoria() -> None:
     with pytest.raises(ValueError, match="Coluna obrigatória"):
         AdaptadorCsvBanco().ler("data;outro\n2026-11-26;10,00\n".encode("utf-8"))
 
-    with pytest.raises(ValueError, match="Linha 2"):
-        AdaptadorPlanilhaGenerica().ler("item;valor\nCerveja;gratis\n".encode("utf-8"))
+    with pytest.raises(ValueError, match="Coluna obrigatória"):
+        AdaptadorCsvBanco().ler("descricao;valor\nAlmoço;10,00\n".encode("utf-8"))
+
+    with pytest.raises(ValueError, match="Coluna obrigatória"):
+        AdaptadorPlanilhaGenerica().ler("item;valor\nCerveja;10,00\n".encode("utf-8"))
+
+
+def test_adaptador_acumula_erros_por_linha_em_erro_importacao() -> None:
+    conteudo = (
+        "item;valor;pagador\n"
+        ";10,00;Carol\n"
+        "Cerveja;gratis;Murilo\n"
+        "Pizza;50,00;\n"
+    ).encode("utf-8")
+
+    with pytest.raises(ErroImportacao) as exc_info:
+        AdaptadorPlanilhaGenerica().ler(conteudo)
+
+    assert len(exc_info.value.erros) == 3
+    assert "Linha 2" in exc_info.value.erros[0]
+    assert "Linha 3" in exc_info.value.erros[1]
+    assert "Linha 4" in exc_info.value.erros[2]
+
+
+def test_gasto_importado_mantem_compatibilidade_sem_pagador() -> None:
+    gasto = GastoImportado("Almoço", 1000, 1)
+    assert gasto.pagador is None

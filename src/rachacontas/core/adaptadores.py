@@ -3,7 +3,7 @@ import io
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
-from rachacontas.core.importacao import FonteGastos, GastoImportado
+from rachacontas.core.importacao import ErroImportacao, FonteGastos, GastoImportado
 
 
 def decodificar_texto(arquivo: bytes) -> str:
@@ -62,6 +62,8 @@ def _ler_tabela(
     delimitadores: tuple[str, ...],
     colunas_descricao: tuple[str, ...],
     colunas_valor: tuple[str, ...],
+    colunas_data: tuple[str, ...] | None = None,
+    colunas_pagador: tuple[str, ...] | None = None,
 ) -> list[GastoImportado]:
     """Lê linhas tabulares e adapta para uma lista de GastoImportado."""
     texto = decodificar_texto(arquivo)
@@ -73,32 +75,64 @@ def _ler_tabela(
     if not leitor.fieldnames:
         return []
 
+    col_data = (
+        _encontrar_coluna(leitor.fieldnames, colunas_data)
+        if colunas_data is not None
+        else None
+    )
     col_descricao = _encontrar_coluna(leitor.fieldnames, colunas_descricao)
     col_valor = _encontrar_coluna(leitor.fieldnames, colunas_valor)
+    col_pagador = (
+        _encontrar_coluna(leitor.fieldnames, colunas_pagador)
+        if colunas_pagador is not None
+        else None
+    )
 
     gastos: list[GastoImportado] = []
+    erros: list[str] = []
     for linha in leitor:
         numero_linha = leitor.line_num
         if not any((valor or "").strip() for valor in linha.values()):
             continue
 
+        linha_valida = True
+
+        if col_data is not None and not (linha.get(col_data) or "").strip():
+            erros.append(f"Linha {numero_linha}: data vazia.")
+            linha_valida = False
+
         descricao = (linha.get(col_descricao) or "").strip()
         if not descricao:
-            raise ValueError(f"Linha {numero_linha}: descrição vazia.")
+            erros.append(f"Linha {numero_linha}: descrição vazia.")
+            linha_valida = False
 
         valor_bruto = (linha.get(col_valor) or "").strip()
+        valor_centavos: int | None = None
         try:
             valor_centavos = reais_para_centavos(valor_bruto)
         except ValueError as erro:
-            raise ValueError(f"Linha {numero_linha}: {erro}") from erro
+            erros.append(f"Linha {numero_linha}: {erro}")
+            linha_valida = False
 
-        gastos.append(
-            GastoImportado(
-                descricao=descricao,
-                valor=valor_centavos,
-                linha=numero_linha,
+        pagador: str | None = None
+        if col_pagador is not None:
+            pagador = (linha.get(col_pagador) or "").strip()
+            if not pagador:
+                erros.append(f"Linha {numero_linha}: pagador vazio.")
+                linha_valida = False
+
+        if linha_valida and valor_centavos is not None:
+            gastos.append(
+                GastoImportado(
+                    descricao=descricao,
+                    valor=valor_centavos,
+                    linha=numero_linha,
+                    pagador=pagador,
+                )
             )
-        )
+
+    if erros:
+        raise ErroImportacao(erros)
 
     return gastos
 
@@ -110,6 +144,7 @@ class AdaptadorCsvBanco(FonteGastos):
         return _ler_tabela(
             arquivo=arquivo,
             delimitadores=(";", ","),
+            colunas_data=("data", "dt", "data_compra", "data da compra"),
             colunas_descricao=(
                 "descricao",
                 "descrição",
@@ -130,4 +165,11 @@ class AdaptadorPlanilhaGenerica(FonteGastos):
             delimitadores=(";", ",", "\t"),
             colunas_descricao=("descricao", "descrição", "item", "nome"),
             colunas_valor=("valor", "preco", "preço", "total"),
+            colunas_pagador=(
+                "pagador",
+                "nome do pagador",
+                "nome_pagador",
+                "responsavel",
+                "responsável",
+            ),
         )
