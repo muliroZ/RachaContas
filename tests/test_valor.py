@@ -1,7 +1,10 @@
 from dataclasses import dataclass
 
 import pytest
+from flask import Flask
 from pydantic import ValidationError
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
 
 from rachacontas.core.valor import (
     Couvert,
@@ -15,7 +18,9 @@ from rachacontas.core.valor import (
     detalhamento,
     montar_arvore,
 )
-from rachacontas.enums import TipoAjuste
+from rachacontas.enums import TipoAjuste, TipoDivisao
+from rachacontas.models import Ajuste, Base, Despesa, Grupo, Item as ItemModel, Participante
+from rachacontas.routes.valor import valor_bp
 from rachacontas.schemas.valor import AjusteIn, ItemIn
 
 
@@ -32,6 +37,9 @@ class LinhaAjusteFalsa:
     tipo: TipoAjuste
     valor: int
     ordem: int
+
+
+# --- Testes de Domínio e Schemas (Fases 0 e 1) ---
 
 
 def test_composite_item_e_grupo_aninhado() -> None:
@@ -154,3 +162,124 @@ def test_schemas_entrada_recursivos() -> None:
 
     with pytest.raises(ValidationError):
         ItemIn(nome="Item sem valor e sem filhos")
+
+
+# --- Testes de Serviço e Rota Flask (Fase 2) ---
+
+
+@pytest.fixture
+def app_cliente():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    app = Flask(__name__)
+    app.config["TESTING"] = True
+    app.config["SESSION_LOCAL"] = TestingSessionLocal
+    app.register_blueprint(valor_bp)
+
+    with TestingSessionLocal() as session:
+        yield app.test_client(), session
+
+    engine.dispose()
+
+
+def _criar_despesa_base(session: Session, *, excluida: bool = False) -> Despesa:
+    grupo = Grupo(nome="Viagem Praia")
+    session.add(grupo)
+    session.flush()
+
+    pagador = Participante(grupo_id=grupo.id, nome="Gustavo")
+    session.add(pagador)
+    session.flush()
+
+    despesa = Despesa(
+        grupo_id=grupo.id,
+        pagador_id=pagador.id,
+        descricao="Almoço",
+        tipo_divisao=TipoDivisao.IGUAL,
+        params_divisao={},
+        excluida=excluida,
+    )
+    session.add(despesa)
+    session.flush()
+    return despesa
+
+
+def test_rota_valor_despesa_com_arvore_e_ajustes(app_cliente) -> None:
+    client, session = app_cliente
+    despesa = _criar_despesa_base(session)
+
+    combo = ItemModel(despesa_id=despesa.id, parent_id=None, nome="Combo", valor=None)
+    session.add(combo)
+    session.flush()
+
+    session.add_all(
+        [
+            ItemModel(despesa_id=despesa.id, parent_id=combo.id, nome="Prato", valor=8000),
+            ItemModel(despesa_id=despesa.id, parent_id=combo.id, nome="Suco", valor=2000),
+            Ajuste(despesa_id=despesa.id, tipo=TipoAjuste.COUVERT, valor=1000, ordem=1),
+            Ajuste(despesa_id=despesa.id, tipo=TipoAjuste.TAXA_SERVICO, valor=1000, ordem=2),
+            Ajuste(despesa_id=despesa.id, tipo=TipoAjuste.DESCONTO, valor=500, ordem=3),
+        ]
+    )
+    session.commit()
+
+    resposta = client.get(f"/despesas/{despesa.id}/valor")
+
+    assert resposta.status_code == 200
+    dados = resposta.get_json()
+    assert dados == {
+        "despesa_id": despesa.id,
+        "subtotal": 10000,
+        "ajustes": [
+            {
+                "tipo": "couvert",
+                "ordem": 1,
+                "valor_ajuste": 1000,
+                "diferenca": 1000,
+                "total_parcial": 11000,
+            },
+            {
+                "tipo": "taxa_servico",
+                "ordem": 2,
+                "valor_ajuste": 1000,
+                "diferenca": 1100,
+                "total_parcial": 12100,
+            },
+            {
+                "tipo": "desconto",
+                "ordem": 3,
+                "valor_ajuste": 500,
+                "diferenca": -500,
+                "total_parcial": 11600,
+            },
+        ],
+        "total": 11600,
+    }
+
+
+def test_rota_valor_despesa_inexistente_ou_excluida_retorna_404(app_cliente) -> None:
+    client, session = app_cliente
+    despesa_excluida = _criar_despesa_base(session, excluida=True)
+    session.commit()
+
+    assert client.get("/despesas/9999/valor").status_code == 404
+    assert client.get(f"/despesas/{despesa_excluida.id}/valor").status_code == 404
+
+
+def test_rota_valor_desconto_maior_que_subtotal_retorna_422(app_cliente) -> None:
+    client, session = app_cliente
+    despesa = _criar_despesa_base(session)
+    session.add_all(
+        [
+            ItemModel(despesa_id=despesa.id, parent_id=None, nome="Café", valor=1000),
+            Ajuste(despesa_id=despesa.id, tipo=TipoAjuste.DESCONTO, valor=1500, ordem=1),
+        ]
+    )
+    session.commit()
+
+    resposta = client.get(f"/despesas/{despesa.id}/valor")
+
+    assert resposta.status_code == 422
+    assert "erro" in resposta.get_json()
