@@ -2,8 +2,9 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 from rachacontas.core.divisao import EstrategiaDivisao, ItemDivisao
-from rachacontas.core.falsos import IgualFalsa
+from rachacontas.core.fabrica_divisao import criar_estrategia
 from rachacontas.core.valor import ComponenteDespesa
+from rachacontas.enums import TipoDivisao
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class DespesaFechamento:
     params_divisao: dict[str, object] = field(default_factory=dict)
     estrategia: EstrategiaDivisao | None = None
     excluida: bool = False
+    tipo_divisao: TipoDivisao | None = None
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,7 @@ def calcular_saldos(
 ) -> dict[int, int]:
     """Calcula o saldo líquido (pago - devido) de cada participante em centavos."""
     saldos: dict[int, int] = {pid: 0 for pid in dict.fromkeys(participantes)}
-    estrategia_default = estrategia_padrao or IgualFalsa()
+    estrategia_default = estrategia_padrao or criar_estrategia(TipoDivisao.IGUAL)
 
     for despesa in despesas:
         if despesa.excluida:
@@ -47,7 +49,14 @@ def calcular_saldos(
         if total < 0:
             raise ValueError("O total da despesa não pode ser negativo.")
 
-        estrategia = despesa.estrategia or estrategia_default
+        estrategia = despesa.estrategia
+        if estrategia is None:
+            estrategia = (
+                criar_estrategia(despesa.tipo_divisao)
+                if despesa.tipo_divisao is not None
+                else estrategia_default
+            )
+
         ids_participantes = despesa.participantes or list(saldos.keys())
         parcelas = estrategia.dividir(
             total=total,
@@ -67,7 +76,7 @@ def calcular_saldos(
 
 
 def quitar(saldos: dict[int, int]) -> list[Transferencia]:
-    """Calcula as transferências mínimas pelo algoritmo guloso (maior credor com maior devedor)."""
+    """Gera transferências pareando o maior credor com o maior devedor."""
     if sum(saldos.values()) != 0:
         raise ValueError("A soma dos saldos deve ser zero para realizar a quitação.")
 
@@ -102,7 +111,7 @@ class FacadeFechamento:
     """Facade de domínio para cálculo de saldos e quitação de um grupo."""
 
     def __init__(self, estrategia_padrao: EstrategiaDivisao | None = None) -> None:
-        self.estrategia_padrao = estrategia_padrao or IgualFalsa()
+        self.estrategia_padrao = estrategia_padrao or criar_estrategia(TipoDivisao.IGUAL)
 
     def calcular_saldos(
         self,
